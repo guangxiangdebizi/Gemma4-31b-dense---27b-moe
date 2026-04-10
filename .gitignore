@@ -33,5 +33,14 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# VPN 配置
+*.vpn/*
+
 # HuggingFace 缓存
 .cache/
+vpn/japan_nodes_info.txt
+vpn/japan_proxies.yaml
+vpn/mihomo-bin
+vpn/start_clash.py
+vpn/supervisord.conf
+vpn/us_proxies.yaml
