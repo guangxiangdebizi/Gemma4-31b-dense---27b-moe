@@ -28,9 +28,13 @@
 | 总参数量 | 30.7B | 25.2B |
 | **激活参数量** | **30.7B (100%)** | **3.8B (15%)** |
 | 层数 | 60 | 30 |
-| 隐藏维度 | 4096 | 5376 |
-| 注意力头数 | 32 | 42 |
-| KV 头数 | 16 | 6 |
+| 隐藏维度 | 4096 | 2816 |
+| 注意力 Q 头数 | 32 | 16 |
+| KV 头数 | 16 | 8 |
+| Head 维度 | 128 | 256 |
+| 专家数 / 激活数 | — | 128 / Top-8 |
+| 单个专家参数 | — | ~6M |
+| MoE 中间维度 | — | 704 |
 | 上下文长度 | 256K | 256K |
 | 词表大小 | 262,144 | 262,144 |
 | 视觉编码器 | SigLIP2 (~550M) | SigLIP2 (~550M) |
@@ -150,19 +154,19 @@ graph TD
     subgraph "26B-A4B MoE — 单层结构 (×30 层)"
         Input_h["输入隐藏状态 h"]
         Input_h --> Norm1["RMSNorm"]
-        Norm1 --> Attn["Multi-Head Attention<br/>42 个 Q 头, 6 个 KV 头<br/>head_dim = 128"]
+        Norm1 --> Attn["Multi-Head Attention<br/>16 个 Q 头, 8 个 KV 头<br/>head_dim = 256"]
         Attn --> Add1["h = h + Attn(h)"]
         Add1 --> Norm2["RMSNorm"]
-        Norm2 --> Router["🔀 Router (路由器)<br/>小型线性层 + Softmax"]
+        Norm2 --> Router["🔀 Router (路由器)<br/>线性层: 2816 → 128<br/>+ Softmax"]
         
-        Router -->|"得分最高"| E1["Expert 1<br/>FFN"]
-        Router -->|"得分第二"| E2["Expert 2<br/>FFN"]
-        Router -.->|"未选中"| E3["Expert 3<br/>FFN"]
-        Router -.->|"未选中"| E4["Expert 4<br/>FFN"]
-        Router -.->|"未选中"| EN["Expert N<br/>FFN"]
+        Router -->|"Top-1"| E1["Expert 1<br/>FFN 6M"]
+        Router -->|"Top-2"| E2["Expert 2<br/>FFN 6M"]
+        Router -->|"..."| E8["Expert 8<br/>FFN 6M"]
+        Router -.->|"未选中"| E9["Expert 9~128<br/>💤 不参与计算"]
         
-        E1 --> WeightSum["加权求和<br/>w₁·E₁(h) + w₂·E₂(h)"]
+        E1 --> WeightSum["加权求和<br/>Σ wₖ·Eₖ(h), k∈Top-8"]
         E2 --> WeightSum
+        E8 --> WeightSum
         WeightSum --> Add2["h = h + MoE(h)"]
     end
     
@@ -199,9 +203,65 @@ graph LR
     style Neuro fill:#9E9E9E,color:#fff
 ```
 
+### 具体配置（来自 config.json）
+
+| 参数 | 值 | 含义 |
+|:---|:---|:---|
+| `num_experts` | **128** | 每层有 128 个专家 |
+| `top_k_experts` | **8** | 每个 token 只激活 8 个（6.25%） |
+| `hidden_size` | 2816 | 隐藏维度 |
+| `moe_intermediate_size` | 704 | 每个专家 FFN 的中间维度 |
+| `num_attention_heads` | 16 | Q 头数 |
+| `num_key_value_heads` | 8 | KV 头数 |
+| `head_dim` | 256 | 每个注意力头的维度 |
+
+### 单个专家的结构
+
+每个专家就是一个微型 GeGLU FFN：
+
+```
+输入 h (2816 维)
+    │
+    ├──→ gate_proj (2816 → 704) ──→ GELU ──┐
+    │                                       ⊙ 逐元素相乘
+    └──→ up_proj   (2816 → 704) ──────────┘
+                                 │
+                           down_proj (704 → 2816)
+                                 │
+                           输出 (2816 维)
+
+单个专家参数 = 3 × 2816 × 704 ≈ 5.95M（约 600 万参数）
+```
+
+### 每层的参数分布
+
+```
+每层专家总参数 = 128 × 5.95M ≈ 761M
+每层激活参数   = 8 × 5.95M   ≈ 48M  ← 实际计算量
+激活比例 = 48M / 761M = 6.25%
+```
+
+### 30 层的注意力类型分布
+
+```
+Layer  1-5:  滑动窗口 × 5  ┐
+Layer  6:    全局注意力     ├─ 每 6 层一个周期
+Layer  7-11: 滑动窗口 × 5  ┤
+Layer 12:    全局注意力     ├─ 5:1 的比例
+Layer 13-17: 滑动窗口 × 5  ┤  滑动窗口:全局 = 25:5
+Layer 18:    全局注意力     ┤
+Layer 19-23: 滑动窗口 × 5  ┤
+Layer 24:    全局注意力     ┤
+Layer 25-29: 滑动窗口 × 5  ┤
+Layer 30:    全局注意力     ┘
+```
+
+> 30 层中只有 **5 层全局注意力**，其余 25 层都是滑动窗口（只看最近 1024 token）。这也解释了为什么 MoE 在 128K 长上下文检索任务上比 Dense（60 层更多全局注意力）差距较大。
+
 **关键数字**：
-- 只有 **30 层**（Dense 的一半），用更宽的层来补偿深度
-- 每层有多个专家 FFN，每个 token 只激活 **Top-K** 个
+- 只有 **30 层**（Dense 的一半），用更宽的层（128 专家）来补偿深度
+- 每层 **128 个专家**，每个 token 只激活 **Top-8**（6.25%）
+- 单个专家仅 **~6M 参数**，极致细粒度分工（对比 Mixtral 8x7B 只有 8 个大专家）
 - 总参数 25.2B，但每次推理只计算 **3.8B**
 - 单次前向传播的 FLOPs ≈ **2 × 3.8B ≈ 7.6 GFLOPs/token**（是 Dense 的 1/8）
 
@@ -301,12 +361,12 @@ sequenceDiagram
     participant E as 被选中的专家们
     participant O as 输出
     
-    T->>R: h × W_router
-    R->>S: logits → 概率分布
-    S->>TopK: [0.05, 0.82, 0.01, 0.72, 0.03, ...]
-    Note over TopK: 选出得分最高的 K 个
-    TopK->>E: 激活 Expert 2 (w=0.82) 和 Expert 4 (w=0.72)
-    E->>O: output = 0.82 × E₂(h) + 0.72 × E₄(h)
+    T->>R: h (2816维) × W_router (2816×128)
+    R->>S: 128 个 logits → Softmax → 概率分布
+    S->>TopK: [0.01, 0.15, 0.003, ..., 0.12, ...] (128个值)
+    Note over TopK: 选出得分最高的 8 个专家
+    TopK->>E: 激活 Expert 7,23,41,55,67,89,102,118
+    E->>O: output = Σ wₖ·Eₖ(h), k∈Top-8
 ```
 
 ### 负载均衡问题
@@ -394,22 +454,25 @@ graph LR
         Q31["Q₃₁ Q₃₂"] --> KV16["KV₁₆"]
     end
     
-    subgraph "26B MoE: 42Q / 6KV"
-        QA["Q₁..Q₇"] --> KVA["KV₁"]
-        QB["Q₈..Q₁₄"] --> KVB["KV₂"]
+    subgraph "26B MoE: 16Q / 8KV"
+        QA["Q₁ Q₂"] --> KVA["KV₁"]
+        QB["Q₃ Q₄"] --> KVB["KV₂"]
         QC["..."] --> KVC["..."]
-        QD["Q₃₆..Q₄₂"] --> KVD["KV₆"]
+        QD["Q₁₅ Q₁₆"] --> KVD["KV₈"]
     end
 ```
 
 | | 31B Dense | 26B-A4B MoE |
 |:---|:---|:---|
-| Q 头数 | 32 | 42 |
-| KV 头数 | 16 | 6 |
-| Q/KV 比 | 2:1 | 7:1 |
-| KV Cache 大小 | 较大 | **更小（KV 头更少）** |
+| Q 头数 | 32 | 16 |
+| KV 头数 | 16 | 8 |
+| head_dim | 128 | 256 |
+| Q/KV 比 | 2:1 | 2:1 |
+| 全局注意力 KV 头 | 16 | 2（`num_global_key_value_heads`） |
+| 层数 | 60 | 30 |
+| KV Cache 大小 | 大（60层×16KV头×128dim） | **小（30层×8KV头×256dim）** |
 
-MoE 版本用了更激进的 GQA 比例（7:1），进一步压缩了 KV Cache 的显存占用。
+MoE 版本层数只有一半，且全局注意力层只有 5 层（全局 KV 头仅 2 个），KV Cache 显存占用远小于 Dense。
 
 ---
 
