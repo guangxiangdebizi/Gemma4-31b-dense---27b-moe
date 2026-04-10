@@ -499,10 +499,135 @@ graph LR
 
 ## 10. 性能与效率对比
 
-<!-- PLACEHOLDER: performance -->
+### 计算效率对比
+
+```mermaid
+graph LR
+    subgraph "每个 Token 的计算量"
+        D["Dense 31B<br/>61.4 GFLOPs/token"]
+        M["MoE 26B-A4B<br/>7.6 GFLOPs/token"]
+    end
+    
+    D ---|"8× 差距"| M
+    
+    style D fill:#2196F3,color:#fff
+    style M fill:#4CAF50,color:#fff
+```
+
+### 显存占用分析
+
+| 组件 | 31B Dense | 26B-A4B MoE |
+|:---|:---|:---|
+| 模型权重 (BF16) | ~62 GB | ~48 GB |
+| KV Cache (32K ctx) | ~15 GB (60层×16KV头) | ~4 GB (30层×6KV头) |
+| 激活值 (推理) | ~2 GB | ~1 GB |
+| **总计 (推理)** | **~79 GB** | **~53 GB** |
+
+> 💡 MoE 虽然要加载全部 48GB 权重到显存（所有专家都要在），但 KV Cache 只有 Dense 的 1/4，因为层数减半 + KV 头更少。
+
+### Benchmark 性能 vs 计算量
+
+```mermaid
+quadrantChart
+    title 性能 vs 计算效率
+    x-axis "低计算量" --> "高计算量"
+    y-axis "低性能" --> "高性能"
+    quadrant-1 "高性能高成本"
+    quadrant-2 "效率之王"
+    quadrant-3 "低端"
+    quadrant-4 "性价比差"
+    "31B Dense": [0.85, 0.92]
+    "26B-A4B MoE": [0.25, 0.88]
+    "Gemma 3 27B": [0.70, 0.45]
+```
+
+### 关键 Benchmark 对比
+
+| Benchmark | 31B Dense | 26B-A4B MoE | MoE 达到 Dense 的 % |
+|:---|:---|:---|:---|
+| MMLU Pro | 85.2% | 82.6% | 96.9% |
+| AIME 2026 | 89.2% | 88.3% | 99.0% |
+| GPQA Diamond | 84.3% | 82.3% | 97.6% |
+| LiveCodeBench v6 | 80.0% | 77.1% | 96.4% |
+| Codeforces ELO | 2150 | 1718 | 79.9% |
+| MRCR 128K | 66.4% | 44.1% | 66.4% |
+| HLE | 19.5% | 8.7% | 44.6% |
+
+**结论**：
+- 常规任务（MMLU、AIME、GPQA）：MoE 达到 Dense **96-99%** 的性能，用 **1/8 的计算量**
+- 极端任务（HLE、长上下文）：Dense 的深度优势（60层）明显体现，MoE 差距较大
 
 ---
 
 ## 11. 微调注意事项
 
-<!-- PLACEHOLDER: finetune -->
+### Dense vs MoE 微调策略差异
+
+```mermaid
+graph TD
+    subgraph "Dense 31B 微调"
+        D_Base["Base 模型权重"]
+        D_Base --> D_LoRA["LoRA 适配器<br/>挂在 Attention + FFN 的线性层上"]
+        D_LoRA --> D_Train["标准训练流程<br/>QLoRA 4-bit ≈ 22GB 显存"]
+    end
+    
+    subgraph "MoE 26B-A4B 微调"
+        M_Base["Base 模型权重"]
+        M_Base --> M_Choice{"微调哪些部分？"}
+        M_Choice -->|"方案A"| M_Attn["只微调 Attention 层<br/>（最安全，不影响专家路由）"]
+        M_Choice -->|"方案B"| M_All["微调 Attention + 所有专家<br/>（效果最好，但可能破坏路由平衡）"]
+        M_Choice -->|"方案C"| M_Active["只微调被激活的专家<br/>（折中方案）"]
+    end
+    
+    style D_LoRA fill:#2196F3,color:#fff
+    style M_Attn fill:#4CAF50,color:#fff
+    style M_All fill:#FF9800,color:#fff
+    style M_Active fill:#9C27B0,color:#fff
+```
+
+### LoRA 配置建议
+
+| 配置项 | Dense 31B | MoE 26B-A4B |
+|:---|:---|:---|
+| target_modules | `q,k,v,o,gate,up,down_proj` | `q,k,v,o_proj`（保守）<br/>或加上专家层（激进） |
+| rank (r) | 16~64 | 16~32 |
+| lora_alpha | 2 × r | 2 × r |
+| QLoRA 显存 | ~22 GB | ~16 GB |
+| 训练注意事项 | 标准流程 | 注意 Router 冻结/解冻策略 |
+
+### MoE 微调的特殊考量
+
+1. **Router 一般冻结**：Router 的权重在预训练中已经学好了"分诊"能力，微调时通常不动它
+2. **负载均衡**：如果微调数据分布和预训练差异大，可能导致某些专家过载
+3. **专家冻结策略**：可以只微调最常被激活的 Top 专家，冻结其余的
+4. **推荐工具**：Unsloth 对 MoE 微调有专门优化，自动处理上述问题
+
+---
+
+## 总结
+
+```mermaid
+mindmap
+    root((Gemma 4 架构对比))
+        Dense 31B
+            60 层深度
+            30.7B 全量计算
+            适合极端推理任务
+            长上下文更强
+            微调简单直接
+        MoE 26B-A4B
+            30 层 + 多专家
+            3.8B 激活参数
+            推理速度 8× 快
+            96-99% 性能
+            参数效率碾压
+        共享设计
+            Transformer Decoder
+            RoPE + RMSNorm
+            滑动窗口注意力
+            SigLIP2 视觉
+            PLE 每层嵌入
+            256K 上下文
+```
+
+> **一句话总结**：Dense 31B 是"一个超强全能选手"，MoE 26B-A4B 是"一支高效的专家团队"。团队用 1/8 的工作量完成了 96% 的任务质量，但在需要极深思考的场景下，全能选手的 60 层深度优势不可替代。
